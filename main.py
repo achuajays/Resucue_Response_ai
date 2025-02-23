@@ -12,7 +12,8 @@ from sqlalchemy.orm import sessionmaker, Session
 from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
-from cors_config import add_cors
+from passlib.context import CryptContext
+from cors_config import add_cors  # Assuming you have cors.py
 
 # Load environment variables
 load_dotenv()
@@ -23,7 +24,16 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 # Database Models
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+
 class MedicalCase(Base):
     __tablename__ = "medical_cases"
     id = Column(Integer, primary_key=True, index=True)
@@ -44,13 +54,13 @@ class Notification(Base):
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-# Initialize FastAPI and Groq client
+# Initialize FastAPI
 app = FastAPI(
     title="Medical Emergency Webhook API",
-    description="API to capture medical webhook data, analyze emergencies, and initiate calls via Bolna.",
+    description="API to capture medical webhooks, initiate calls, manage users, and display results.",
     version="1.0.0",
 )
-add_cors(app)
+add_cors(app)  # Apply CORS
 client = Groq(api_key=os.getenv("groq_api_key"))
 
 # Dependency for database session
@@ -61,10 +71,9 @@ def get_db():
     finally:
         db.close()
 
-# Pydantic model for webhook payload
+# Pydantic models
 class WebhookData(BaseModel):
     extracted_data: Optional[Dict] = None
-
     class Config:
         schema_extra = {
             "example": {
@@ -77,11 +86,9 @@ class WebhookData(BaseModel):
             }
         }
 
-# Pydantic model for call payload
 class CallData(BaseModel):
     phone_number: str
     user_data: Optional[Dict] = None
-
     class Config:
         schema_extra = {
             "example": {
@@ -93,18 +100,21 @@ class CallData(BaseModel):
             }
         }
 
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
 # Bolna API Call Function
 async def make_bolna_call(recipient_phone_number: str, user_data: Dict) -> Dict:
-    """
-    Make a phone call using Bolna's API.
-    """
     url = "https://api.bolna.dev/call"
     agent_id = os.getenv("agent_id")
     token = os.getenv("Authorization")
-
     if not all([agent_id, token]):
         raise HTTPException(status_code=500, detail="Missing Bolna API credentials.")
-
     payload = {
         "agent_id": agent_id,
         "recipient_phone_number": recipient_phone_number,
@@ -114,7 +124,6 @@ async def make_bolna_call(recipient_phone_number: str, user_data: Dict) -> Dict:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
-
     try:
         response = requests.post(url, json=payload, headers=headers)
         response.raise_for_status()
@@ -124,9 +133,6 @@ async def make_bolna_call(recipient_phone_number: str, user_data: Dict) -> Dict:
 
 # Emergency Analysis Function
 async def analyze_emergency_status(data: Dict) -> tuple[bool, Dict]:
-    """
-    Analyze medical data to determine emergency status using Groq.
-    """
     content_str = json.dumps(data)
     try:
         chat_completion = client.chat.completions.create(
@@ -142,7 +148,7 @@ async def analyze_emergency_status(data: Dict) -> tuple[bool, Dict]:
                         "recommended_action": string,
                         "processed_data": object,
                         "required_specialists": array of strings
-                    } dont include any additional text or ```.
+                    }
                     """
                 },
                 {"role": "user", "content": f"Analyze this medical data: {content_str}"}
@@ -158,25 +164,49 @@ async def analyze_emergency_status(data: Dict) -> tuple[bool, Dict]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
+# Signup Endpoint
+@app.post("/signup", summary="Create a New User", description="Register a new user with username and password.")
+async def signup(user: UserCreate, db: Session = Depends(get_db)):
+    """
+    Register a new user by storing their username and hashed password in the database.
+    """
+    # Check if username already exists
+    existing_user = db.query(User).filter(User.username == user.username).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    # Hash the password
+    hashed_password = pwd_context.hash(user.password)
+
+    # Create new user
+    db_user = User(username=user.username, hashed_password=hashed_password)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+
+    return {"status": "success", "message": "User created successfully", "username": user.username}
+
+# Login Endpoint
+@app.post("/login", summary="User Login", description="Login with username and password.")
+async def login(user: UserLogin, db: Session = Depends(get_db)):
+    """
+    Authenticate a user by checking username and password.
+    """
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    return {"status": "success", "message": "Login successful", "username": user.username}
+
 # Webhook Endpoint
-@app.post("/webhook",
-    summary="Process Medical Webhook Data",
-    description="Receives medical data via webhook, analyzes it for emergency status, and saves it to the database. Use this to simulate incoming patient data."
-)
+@app.post("/webhook", summary="Process Medical Webhook Data", description="Receives medical data via webhook.")
 async def webhook(data: WebhookData, db: Session = Depends(get_db)):
-    """
-    Capture webhook data, analyze it for emergency status, and save to database.
-    """
     try:
         extracted_data = data.extracted_data
         if not extracted_data:
             return {"status": "success", "message": "No data to process"}
-
         timestamp = datetime.now().isoformat()
-        print(extracted_data)
         is_emergency, analysis = await analyze_emergency_status(extracted_data)
-
-        # Save medical case
         medical_case = MedicalCase(
             timestamp=timestamp,
             is_emergency=is_emergency,
@@ -189,65 +219,42 @@ async def webhook(data: WebhookData, db: Session = Depends(get_db)):
         case_id_str = f"CASE-{medical_case.id:04d}"
         medical_case.case_id = case_id_str
         db.commit()
-
         response_data = {
             "status": "success",
             "case_id": case_id_str,
             "severity": analysis["severity_level"]
         }
-
         if is_emergency:
             response_data["message"] = "Emergency data processed (call via /call)"
         else:
             response_data["message"] = "Non-emergency data processed"
-
         return response_data
-
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Webhook error: {str(e)}")
 
 # Call Endpoint
-@app.post("/call",
-    summary="Initiate a Bolna Call",
-    description="Initiates a phone call to a new patient using Bolna's API. Provide a phone number and optional user data."
-)
+@app.post("/call", summary="Initiate a Bolna Call", description="Initiates a phone call to a new patient.")
 async def invoke_call(data: CallData):
-    """
-    Invoke a Bolna call for a new patient using only a phone number.
-    """
     try:
         if not data.phone_number:
             raise HTTPException(status_code=400, detail="Phone number is required")
-
-        # Use provided user_data or an empty dict if none provided
         call_user_data = data.user_data or {}
-
-        # Make the Bolna call
         call_response = await make_bolna_call(data.phone_number, call_user_data)
-
         return {
             "status": "success",
             "message": "Call initiated successfully",
             "phone_number": data.phone_number,
             "call_response": call_response
         }
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Call invocation failed: {str(e)}")
 
 # Display Endpoint
-@app.get("/display", response_class=HTMLResponse,
-    summary="View Medical Dashboard",
-    description="Displays a dashboard of all processed medical cases and notifications."
-)
+@app.get("/display", response_class=HTMLResponse, summary="View Medical Dashboard", description="Displays all cases.")
 def display_dashboard(db: Session = Depends(get_db)):
-    """
-    Display a dashboard of all medical cases and notifications.
-    """
     emergency_cases = db.query(MedicalCase).filter(MedicalCase.is_emergency == True).all()
     non_emergency_cases = db.query(MedicalCase).filter(MedicalCase.is_emergency == False).all()
     notifications = db.query(Notification).all()
-
     html_content = """
     <html>
         <head>
@@ -271,8 +278,6 @@ def display_dashboard(db: Session = Depends(get_db)):
             <h1>Medical Dashboard</h1>
             <div class="dashboard">
     """
-
-    # Emergency Cases
     html_content += "<div class='section'><h2>Emergency Cases</h2>"
     for case in emergency_cases:
         severity = case.analysis.get("severity_level", "UNKNOWN")
@@ -286,8 +291,6 @@ def display_dashboard(db: Session = Depends(get_db)):
             </div>
         """
     html_content += "</div>"
-
-    # Non-Emergency Cases
     html_content += "<div class='section'><h2>Non-Emergency Cases</h2>"
     for case in non_emergency_cases:
         severity = case.analysis.get("severity_level", "UNKNOWN")
@@ -301,8 +304,6 @@ def display_dashboard(db: Session = Depends(get_db)):
             </div>
         """
     html_content += "</div>"
-
-    # Notifications
     html_content += "<div class='section'><h2>Notifications</h2>"
     for notification in notifications:
         html_content += f"""
@@ -312,7 +313,6 @@ def display_dashboard(db: Session = Depends(get_db)):
             </div>
         """
     html_content += "</div></div></body></html>"
-
     return HTMLResponse(content=html_content)
 
 # Custom OpenAPI schema
@@ -325,7 +325,6 @@ def custom_openapi():
         description="A FastAPI application to process medical webhooks, initiate calls, and display results.",
         routes=app.routes,
     )
-    # Add custom Swagger UI parameters
     openapi_schema["info"]["x-logo"] = {"url": "https://fastapi.tiangolo.com/img/logo-margin/logo-teal.png"}
     app.openapi_schema = openapi_schema
     return app.openapi_schema

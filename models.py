@@ -5,7 +5,7 @@ class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
-    password = Column(String)  # Plain text password
+    password = Column(String , name="hashed_password")  # Plain text password
 
 class MedicalCase(Base):
     __tablename__ = "medical_cases"
